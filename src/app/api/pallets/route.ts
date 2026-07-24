@@ -42,11 +42,22 @@ export async function GET(req: NextRequest) {
     const supplierId = searchParams.get("supplier_id") || "";
     const from = searchParams.get("from") || "";
     const to = searchParams.get("to") || "";
+    // `limit` để màn hình mobile lấy ít bản ghi khi đang gõ tìm kiếm.
+    // Mặc định giữ 200 như cũ để không đổi hành vi các màn hình đang gọi.
+    const limitParam = Number(searchParams.get("limit"));
+    const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 200) : 200;
+    // KPI phải groupBy toàn bảng pallet — rất tốn khi gõ tìm kiếm liên tục.
+    const skipKpis = searchParams.get("skip_kpis") === "1";
 
     const where: Record<string, unknown> = {};
 
+    // Cho phép lọc nhiều trạng thái, ngăn cách bằng dấu phẩy:
+    //   ?status=IN_STORAGE,IN_STAGING
+    // Trước đây gán thẳng chuỗi vào `where.status` nên Prisma ném lỗi 500 —
+    // khiến màn "Tạo phiếu điều chỉnh tồn" (UC-INV-09) không nạp được pallet nào.
     if (status) {
-      where.status = status;
+      const statusList = status.split(",").map((s) => s.trim()).filter(Boolean);
+      where.status = statusList.length > 1 ? { in: statusList } : statusList[0];
     }
     if (supplierId) {
       where.supplier_id = supplierId;
@@ -65,25 +76,50 @@ export async function GET(req: NextRequest) {
       where.OR = [
         { code: { contains: q, mode: "insensitive" } },
         { note: { contains: q, mode: "insensitive" } },
+        // Xe nâng nghĩ theo KỆ chứ không theo mã pallet — cho tìm luôn bằng mã vị trí
+        // (vd gõ "B-24" ra mọi pallet đang nằm ở kệ B-24).
+        { location: { code: { contains: q, mode: "insensitive" } } },
+        // Ô tìm kiếm ở màn Thủ kho ghi "Tìm theo mã pallet, NCC…" nên phải
+        // tìm được cả theo tên/mã nhà cung cấp.
+        { supplier: { name: { contains: q, mode: "insensitive" } } },
+        { supplier: { code: { contains: q, mode: "insensitive" } } },
       ];
     }
 
-    const pallets = await prisma.pallet.findMany({
+    // Phân trang server-side — chỉ bật khi client truyền `page`.
+    // Không truyền thì giữ nguyên hành vi cũ (lấy `limit` bản ghi đầu) để các
+    // màn hình đang gọi không bị đổi.
+    const pageParamRaw = Number(searchParams.get("page"));
+    const usePaging = Number.isFinite(pageParamRaw) && pageParamRaw > 0;
+    const page = usePaging ? Math.floor(pageParamRaw) : 1;
+
+    const listArgs = {
       where,
-      orderBy: { created_at: "desc" },
+      // `created_at` một mình KHÔNG đủ để sắp xếp ổn định: pallet nhập hàng loạt
+      // có thể trùng mốc thời gian, khi đó phân trang sẽ làm một bản ghi xuất hiện
+      // ở hai trang hoặc biến mất. Thêm `id` làm khoá phụ.
+      orderBy: [{ created_at: "desc" as const }, { id: "desc" as const }],
       include: {
         supplier: { select: { id: true, code: true, name: true } },
         location: { select: { id: true, code: true, zone: true, rack: true, level: true } },
         inbound_request: { select: { id: true, code: true } },  // UC-PAL-01: link PHN
         movements: {
-          where: { movement_type: "STAGE_OUT" },
-          orderBy: { performed_at: "desc" },
+          where: { movement_type: "STAGE_OUT" as const },
+          orderBy: { performed_at: "desc" as const },
           take: 1,
           select: { performed_at: true },
         },
       },
-      take: 200,
-    });
+      take: limit,
+      ...(usePaging ? { skip: (page - 1) * limit } : {}),
+    };
+
+    const [pallets, filteredTotal] = usePaging
+      ? await prisma.$transaction([
+          prisma.pallet.findMany(listArgs),
+          prisma.pallet.count({ where }),
+        ])
+      : [await prisma.pallet.findMany(listArgs), 0];
 
     const mapped = pallets.map((p) => {
       const stageMv = p.movements?.[0];
@@ -99,20 +135,39 @@ export async function GET(req: NextRequest) {
       };
     });
 
-    // KPIs
-    const allPallets = await prisma.pallet.groupBy({
-      by: ["status"],
-      _count: true,
-    });
+    // KPIs — bỏ qua khi client không cần (vd ô lọc nhanh gọi liên tục lúc gõ).
     const kpis: Record<string, number> = {};
-    let total = 0;
-    for (const g of allPallets) {
-      kpis[g.status] = g._count;
-      total += g._count;
+    if (!skipKpis) {
+      const allPallets = await prisma.pallet.groupBy({
+        by: ["status"],
+        _count: true,
+      });
+      let total = 0;
+      for (const g of allPallets) {
+        kpis[g.status] = g._count;
+        total += g._count;
+      }
+      kpis.TOTAL = total;
     }
-    kpis.TOTAL = total;
 
-    return NextResponse.json({ success: true, data: mapped, kpis });
+    // `pagination.total` = tổng SAU khi lọc, khác `kpis.TOTAL` = tổng toàn bảng.
+    // Chân trang phải dùng `pagination.total`; lẫn hai con số này chính là nguyên
+    // nhân màn Thủ kho hiện "224 pallet" ở đầu trang nhưng "/ 200" ở chân trang.
+    return NextResponse.json({
+      success: true,
+      data: mapped,
+      kpis,
+      ...(usePaging
+        ? {
+            pagination: {
+              page,
+              limit,
+              total: filteredTotal,
+              totalPages: Math.max(1, Math.ceil(filteredTotal / limit)),
+            },
+          }
+        : {}),
+    });
   } catch (error) {
     console.error("GET /api/pallets error:", error);
     return NextResponse.json(

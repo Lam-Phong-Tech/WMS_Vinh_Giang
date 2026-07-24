@@ -238,12 +238,12 @@ export default function ForkliftMobileDashboard() {
           </div>
         </div>
         <div className="industrial-card p-md rounded-xl flex flex-col gap-xs shadow-sm bg-surface">
-          <span className="text-[11px] md:text-xs font-medium text-on-surface-variant/80">Yêu cầu di chuyển</span>
+          <span className="text-[11px] md:text-xs font-medium text-on-surface-variant/80">Pallet trong kho</span>
           <div className="flex items-baseline gap-xs mt-1">
             <span className="text-3xl font-bold font-jetbrains text-primary">
               {kpis.RELOCATE ?? 0}
             </span>
-            <span className="text-xs text-on-surface-variant">lệnh</span>
+            <span className="text-xs text-on-surface-variant">pallet</span>
           </div>
         </div>
         <div className="industrial-card p-md rounded-xl flex flex-col gap-xs shadow-sm bg-surface">
@@ -256,12 +256,12 @@ export default function ForkliftMobileDashboard() {
           </div>
         </div>
         <div className="industrial-card p-md rounded-xl flex flex-col gap-xs shadow-sm bg-surface">
-          <span className="text-[11px] md:text-xs font-medium text-on-surface-variant/80">Hoàn trả vị trí</span>
+          <span className="text-[11px] md:text-xs font-medium text-on-surface-variant/80">Ở khu chờ xuất</span>
           <div className="flex items-baseline gap-xs mt-1">
             <span className="text-3xl font-bold font-jetbrains text-amber-600">
               {kpis.RETURN ?? 0}
             </span>
-            <span className="text-xs text-on-surface-variant">lệnh</span>
+            <span className="text-xs text-on-surface-variant">pallet</span>
           </div>
         </div>
       </section>
@@ -350,9 +350,9 @@ export default function ForkliftMobileDashboard() {
               <span className="material-symbols-outlined text-[40px] opacity-30 text-success mb-2">check_circle</span>
               <p className="text-sm text-on-surface-variant">
                 {activeTab === "PUT_AWAY" ? "Không có pallet nào chờ xếp vị trí." :
-                 activeTab === "RELOCATE" ? "Không có yêu cầu luân chuyển." :
+                 activeTab === "RELOCATE" ? "Chưa có pallet nào trong kho để sắp xếp lại." :
                  activeTab === "TO_STAGING_OUT" ? "Không có yêu cầu sang chờ xuất." :
-                 "Không có yêu cầu hoàn trả vị trí."}
+                 "Không có pallet nào ở khu chờ xuất."}
               </p>
             </div>
           ) : (
@@ -400,8 +400,16 @@ export default function ForkliftMobileDashboard() {
 
                   <div className="flex justify-between items-start pl-1">
                     <span className="font-mono text-sm font-bold text-primary">{p.code}</span>
-                    <span className="bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full text-[10px] md:text-xs font-bold">
-                      Chờ đưa vào
+                    {/* Nhãn theo tab: mỗi tab là một loại việc khác nhau, không phải
+                        tab nào cũng là "chờ đưa vào vị trí". */}
+                    <span className={`px-2 py-0.5 rounded-full text-[10px] md:text-xs font-bold ${
+                      activeTab === "RELOCATE" ? "bg-blue-100 text-blue-700"
+                      : activeTab === "RETURN" ? "bg-rose-100 text-rose-700"
+                      : "bg-amber-100 text-amber-700"
+                    }`}>
+                      {activeTab === "RELOCATE" ? "Trong kho"
+                       : activeTab === "RETURN" ? "Ở khu chờ xuất"
+                       : "Chờ đưa vào"}
                     </span>
                   </div>
 
@@ -412,15 +420,18 @@ export default function ForkliftMobileDashboard() {
                     {nearestExpiry && <> · Date gần nhất: <b>{nearestExpiry}</b></>}
                   </div>
 
-                  {/* PHN + XN time */}
+                  {/* PHN + XN time. Riêng RELOCATE/RETURN thì vị trí hiện tại mới là
+                      thông tin cần, còn "chờ bao lâu" chỉ có nghĩa với hàng chờ xếp. */}
                   <div className="pl-1 flex flex-wrap gap-2 text-[11px] md:text-xs text-on-surface-variant/80">
-                    {p.inbound_request?.code && (
-                      <span>📥 {p.inbound_request.code}</span>
+                    {p.location?.code ? (
+                      <span>📍 {p.location.code}</span>
+                    ) : (
+                      p.inbound_request?.code && <span>📥 {p.inbound_request.code}</span>
                     )}
-                    {confirmedTime && (
+                    {confirmedTime && activeTab === "PUT_AWAY" && (
                       <span>⏱ XN {confirmedTime}</span>
                     )}
-                    {p.confirmed_at && (
+                    {p.confirmed_at && activeTab === "PUT_AWAY" && (
                       <span className="ml-auto text-[10px] md:text-xs font-semibold text-[#ea580c]">
                         Chờ {getWaitTime(p.confirmed_at)}
                       </span>
