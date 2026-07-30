@@ -1,11 +1,14 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { requireAuth, apiErrorResponse } from "@/lib/auth-server";
+import { requirePermission, guardPermission, apiErrorResponse } from "@/lib/auth-server";
 import { validateSpecification } from "@/lib/spec-validate";
 import { notifyByRoles } from "@/lib/notifications";
+import { buildUserIdentitySet, assertNotAccount } from "@/lib/item-code-guard";
 
 // GET: Danh sách mã hàng (search, filter status, paging, sort)
 export async function GET(req: Request) {
+  const denied = await guardPermission(req, "item_code", "read");
+  if (denied) return denied;
   try {
     const url = new URL(req.url);
     const search = (url.searchParams.get("search") || url.searchParams.get("q"))?.trim() || "";
@@ -191,7 +194,7 @@ export async function GET(req: Request) {
 
 // POST: Tạo mã hàng mới (Thủ kho — TC_001_001 → TC_001_015)
 export async function POST(req: Request) {
-  try { await requireAuth(req); } catch (e) { return apiErrorResponse(e); }
+  try { await requirePermission(req, "item_code", "write"); } catch (e) { return apiErrorResponse(e); }
   try {
     const body = await req.json();
     let { code, barcode, short_name, unit_id, specification, units_per_box, weight_per_box, photo_url, note } = body;
@@ -257,6 +260,22 @@ export async function POST(req: Request) {
         { success: false, error: "Tên rút gọn không vượt quá 100 ký tự.", field: "short_name" },
         { status: 400 }
       );
+    }
+
+    // WVG-63: chặn dữ liệu tài khoản (email/SĐT/trùng account) lọt vào mã hàng —
+    // đặc biệt bịt lỗ `short_name` (trước đây không kiểm định dạng).
+    const userIdentitySet = buildUserIdentitySet(
+      await prisma.user.findMany({
+        select: { email: true, phone: true, username: true, full_name: true },
+      })
+    );
+    const codeAcctErr = assertNotAccount(code, userIdentitySet, "Mã hàng");
+    if (codeAcctErr) {
+      return NextResponse.json({ success: false, error: codeAcctErr, field: "code" }, { status: 400 });
+    }
+    const nameAcctErr = assertNotAccount(short_name, userIdentitySet, "Tên rút gọn");
+    if (nameAcctErr) {
+      return NextResponse.json({ success: false, error: nameAcctErr, field: "short_name" }, { status: 400 });
     }
 
     // Validate trọng lượng >= 0

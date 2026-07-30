@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { STOCK_PALLET_STATUSES } from "@/lib/inventory-constants";
+import { expiredLineWhere, expiryCutoff } from "@/lib/inventory-expiry";
+import { guardPermission } from "@/lib/auth-server";
 
 /**
  * GET /api/dashboard/accountant-kpi
@@ -14,11 +16,14 @@ import { STOCK_PALLET_STATUSES } from "@/lib/inventory-constants";
  * + Cảnh báo: HSD ≤7d, ≤30d, low_stock (tạm 0 — schema chưa có min_stock)
  * + Recent: 5 phiếu vừa cập nhật (mix Inbound + Adjustment, sort updated_at desc)
  */
-export async function GET() {
+export async function GET(req: Request) {
+  const denied = await guardPermission(req, "dashboard", "read");
+  if (denied) return denied;
   try {
     const now = new Date();
     const d7 = new Date(now.getTime() + 7 * 86400000);
     const d30 = new Date(now.getTime() + 30 * 86400000);
+    const cutoff = expiryCutoff(now); // WVG-239: mốc hết hạn (GMT+7)
 
     const [
       inboundProcessing,
@@ -29,6 +34,7 @@ export async function GET() {
       pendingAdjustments,
       expiring7d,
       expiring30d,
+      expiredItems,
       recentInbounds,
       recentAdjustments,
     ] = await Promise.all([
@@ -55,17 +61,24 @@ export async function GET() {
       `,
       // 4. Phiếu điều chỉnh chờ duyệt
       prisma.adjustmentVoucher.count({ where: { status: "PENDING" } }),
-      // Cảnh báo HSD
+      // Cảnh báo HSD — WVG-239: "sắp hết hạn" chỉ tính lô CÒN hạn (>= hôm nay).
       prisma.palletLine.count({
         where: {
           pallet: { status: { in: STOCK_PALLET_STATUSES } },
-          expiry_date: { lte: d7 },
+          expiry_date: { gte: cutoff, lte: d7 },
         },
       }),
       prisma.palletLine.count({
         where: {
           pallet: { status: { in: STOCK_PALLET_STATUSES } },
           expiry_date: { lte: d30, gt: d7 },
+        },
+      }),
+      // Đã hết hạn (bị chặn xuất)
+      prisma.palletLine.count({
+        where: {
+          pallet: { status: { in: STOCK_PALLET_STATUSES } },
+          ...expiredLineWhere(cutoff),
         },
       }),
       // Recent: 5 phiếu nhập vừa cập nhật
@@ -96,6 +109,18 @@ export async function GET() {
         stockMap[s.item_code_id] = Number(s._sum.qty_box || 0);
       }
     }
+    // WVG-239: trừ phần hết hạn → tồn KHẢ DỤNG, để hàng hết hạn không "che" cảnh báo thiếu.
+    const blockedStock = await prisma.palletLine.groupBy({
+      by: ["item_code_id"],
+      where: { pallet: { status: { in: STOCK_PALLET_STATUSES } }, ...expiredLineWhere(cutoff) },
+      _sum: { qty_box: true },
+    });
+    const sellableMap: Record<string, number> = { ...stockMap };
+    for (const s of blockedStock) {
+      if (s.item_code_id) {
+        sellableMap[s.item_code_id] = (stockMap[s.item_code_id] || 0) - Number(s._sum.qty_box || 0);
+      }
+    }
     const itemCodes = await prisma.itemCode.findMany({
       where: { status: "standardized" },
       select: {
@@ -105,7 +130,7 @@ export async function GET() {
     });
     const lowStockSkus = itemCodes.filter((ic) => {
       const minStock = Number(ic.product?.min_stock || 0);
-      return minStock > 0 && (stockMap[ic.id] || 0) < minStock;
+      return minStock > 0 && (sellableMap[ic.id] || 0) < minStock;
     }).length;
 
     // Merge recent updates (5 inbound + 3 adjustment) — sort theo time desc, take 5
@@ -146,6 +171,7 @@ export async function GET() {
         pending_adjustments: pendingAdjustments,
         expiring_7d: expiring7d,
         expiring_30d: expiring30d,
+        expired_items: expiredItems,
         low_stock_skus: lowStockSkus,
         recent_updates: merged,
       },

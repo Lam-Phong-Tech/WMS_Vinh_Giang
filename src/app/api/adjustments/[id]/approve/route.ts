@@ -2,8 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { Prisma } from "@prisma/client";
 import { STOCK_PALLET_STATUSES } from "@/lib/inventory-constants";
-import { requireAuth, apiErrorResponse } from "@/lib/auth-server";
+import { requirePermission, apiErrorResponse } from "@/lib/auth-server";
 import { notifyByRoles } from "@/lib/notifications";
+import { warehouseDateParts } from "@/lib/warehouse-date";
 
 // POST /api/adjustments/[id]/approve — Phê duyệt phiếu điều chỉnh
 //
@@ -19,7 +20,7 @@ export async function POST(
 ) {
   try {
     // UC-INV-09-TC17: chỉ Quản lý (+ super-role ADMIN/MANAGER/STAFF) được phê duyệt
-    const { user } = await requireAuth(req, ["QUAN_LY"]);
+    const { user } = await requirePermission(req, "inventory", "special");
     const { id } = await params;
     const voucher = await prisma.adjustmentVoucher.findUnique({
       where: { id },
@@ -74,15 +75,11 @@ export async function POST(
           const upb = ic?.units_per_box || 1;
           const wpb = ic?.weight_per_box ? Number(ic.weight_per_box) : 0;
 
-          // Sinh mã pallet PLYYMMDD.NNN — race-safe (đồng bộ logic generatePalletCode ở /api/pallets)
-          const today = new Date();
-          today.setUTCHours(0, 0, 0, 0);
-          const yy = String(today.getUTCFullYear()).slice(-2);
-          const mm = String(today.getUTCMonth() + 1).padStart(2, "0");
-          const dd = String(today.getUTCDate()).padStart(2, "0");
-          const dayKey = `pallet_seq_${yy}${mm}${dd}`;
+          // Sinh mã pallet PLYYMMDD.NNN — race-safe (đồng bộ generatePalletCode ở /api/pallets).
+          // WVG-98: ngày kho GMT+7 để mã không lệch 1 ngày gần nửa đêm VN.
+          const { yy, mm, dd, codeDate, dayKey } = warehouseDateParts();
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${dayKey}))`;
-          const maxSeq = await tx.pallet.aggregate({ where: { code_date: today }, _max: { code_seq: true } });
+          const maxSeq = await tx.pallet.aggregate({ where: { code_date: codeDate }, _max: { code_seq: true } });
           const nextSeq = (maxSeq._max.code_seq ?? 0) + 1;
           const palletCode = `PL${yy}${mm}${dd}.${String(nextSeq).padStart(3, "0")}`;
 
@@ -92,13 +89,16 @@ export async function POST(
           const newPallet = await tx.pallet.create({
             data: {
               code: palletCode,
-              code_date: today,
+              code_date: codeDate,
               code_seq: nextSeq,
               status: "IN_STORAGE",
               location_id: line.location_id,
               total_lines: 1,
               total_weight_kg: new Prisma.Decimal(weightKg),
               created_by: user.id,
+              // WVG-97: nguồn truy vết = phiếu điều chỉnh/kiểm kê.
+              source_type: "ADJUSTMENT",
+              source_id: voucher.id,
               note: `Pallet ngoài hệ thống — phát hiện khi kiểm kê (phiếu ${voucher.code})`,
             },
           });

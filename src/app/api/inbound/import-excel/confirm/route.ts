@@ -2,10 +2,17 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { Prisma } from "@prisma/client";
 import { notifyByRoles } from "@/lib/notifications";
+import { requirePermission, apiErrorResponse } from "@/lib/auth-server";
+import { buildUserIdentitySet, assertNotAccount } from "@/lib/item-code-guard";
+import { warehouseDateParts } from "@/lib/warehouse-date";
+
+// Regex mã hàng — đồng bộ với POST /api/item-codes (chặn ký tự lạ, kể cả '@').
+const ITEM_CODE_RE = /^[A-Za-z0-9\-_./]+$/;
 
 // Helper: Sinh mã phiếu nhập PHN-{YYYY}-{SSSS}
 async function generateInboundCode(): Promise<{ code: string; codeYear: number; codeSeq: number }> {
-  const year = new Date().getFullYear();
+  // WVG-98: năm theo giờ kho GMT+7 (không lệch ở ranh giới năm gần nửa đêm VN).
+  const year = warehouseDateParts().year;
   const maxSeq = await prisma.inboundRequest.aggregate({
     where: { code_year: year },
     _max: { code_seq: true },
@@ -27,6 +34,13 @@ interface ConfirmLine {
 
 // POST /api/inbound/import-excel/confirm — Xác nhận mapping & tạo phiếu nhập
 export async function POST(req: NextRequest) {
+  let userId: string;
+  try {
+    const ctx = await requirePermission(req, "inbound", "write");
+    userId = ctx.user.id;
+  } catch (e) {
+    return apiErrorResponse(e);
+  }
   try {
     const body = await req.json();
     const { supplier_id, expected_date, invoice_no, note, lines, import_type, warehouse } = body;
@@ -59,6 +73,19 @@ export async function POST(req: NextRequest) {
         );
       }
     }
+
+    // WVG-63: nạp danh tính tài khoản 1 lần để chặn account lọt thành mã hàng.
+    // (Chỉ cần khi có dòng tạo mã tạm — nhưng users nhỏ nên nạp luôn cho gọn.)
+    const needAccountGuard = lines.some(
+      (l: ConfirmLine) => l.create_temp_code && !l.item_code_id
+    );
+    const userIdentitySet = needAccountGuard
+      ? buildUserIdentitySet(
+          await prisma.user.findMany({
+            select: { email: true, phone: true, username: true, full_name: true },
+          })
+        )
+      : new Set<string>();
 
     // Xử lý từng dòng: tạo ItemCode tạm nếu cần
     const processedLines: {
@@ -93,6 +120,29 @@ export async function POST(req: NextRequest) {
           );
         }
 
+        // WVG-63: chặn ký tự lạ + dữ liệu tài khoản (email/SĐT/trùng account)
+        // để account không lọt thành mã hàng khi import nhầm file/sheet.
+        if (!ITEM_CODE_RE.test(tempCode)) {
+          return NextResponse.json(
+            { success: false, error: `Dòng ${i + 1}: Mã hàng "${tempCode}" chứa ký tự không hợp lệ (chỉ chữ, số, - _ . /).` },
+            { status: 400 }
+          );
+        }
+        const codeAcctErr = assertNotAccount(tempCode, userIdentitySet, "Mã hàng");
+        if (codeAcctErr) {
+          return NextResponse.json(
+            { success: false, error: `Dòng ${i + 1}: ${codeAcctErr}` },
+            { status: 400 }
+          );
+        }
+        const nameAcctErr = assertNotAccount(tempName, userIdentitySet, "Tên hàng");
+        if (nameAcctErr) {
+          return NextResponse.json(
+            { success: false, error: `Dòng ${i + 1}: ${nameAcctErr}` },
+            { status: 400 }
+          );
+        }
+
         // Kiểm tra đã tồn tại chưa (tránh trùng code)
         const existing = await prisma.itemCode.findUnique({
           where: { code: tempCode },
@@ -102,13 +152,14 @@ export async function POST(req: NextRequest) {
           // Nếu đã tồn tại → dùng luôn
           itemCodeId = existing.id;
         } else {
-          // Tạo ItemCode tạm với status = 'pending'
+          // Tạo ItemCode tạm với status = 'pending' — GHI created_by để truy vết.
           const tempItem = await prisma.itemCode.create({
             data: {
               code: tempCode,
               short_name: tempName || tempCode,
               status: "pending",
               note: "Tạo tự động từ import Excel",
+              created_by: userId,
             },
           });
           itemCodeId = tempItem.id;

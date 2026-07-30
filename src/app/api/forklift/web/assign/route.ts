@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { guardPermission } from "@/lib/auth-server";
 
 export async function POST(req: NextRequest) {
+  const denied = await guardPermission(req, "forklift", "write");
+  if (denied) return denied;
   try {
     const body = await req.json();
     const { pallet_id, driver_id } = body;
@@ -53,11 +56,15 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 3. Create a movement record to mark it as assigned (In Progress / Đang di chuyển)
+    // 3. Create a movement record to mark it as assigned (In Progress / Đang di chuyển).
+    // WVG-179: đây là marker GIAO VIỆC (chưa move vật lý, đích chưa xác định) → bổ sung
+    // nguồn (from_location) + actor + reason. Move vật lý thực tế (put-away/relocate)
+    // ghi snapshot đầy đủ item/lot/qty theo từng dòng ở route tương ứng.
     const movement = await prisma.movement.create({
       data: {
         pallet_id,
         movement_type: "PUT_AWAY",
+        from_location_id: pallet.location_id ?? null,
         performed_by: driver_id,
         reason: `Giao việc bởi Admin cho tài xế ${driver.full_name}`,
       },

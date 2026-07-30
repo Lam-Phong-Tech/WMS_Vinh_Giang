@@ -31,6 +31,31 @@ function todayISO() {
   const t = new Date();
   return `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}`;
 }
+// Tự chèn dấu "/" khi gõ: chỉ giữ số, tối đa 8 chữ số (ddmmyyyy) → "dd/mm/yyyy".
+// Kẹp số vô lý ngay khi đủ 2 chữ số: ngày > 31 → 31, tháng > 12 → 12.
+export function formatTyping(raw: string) {
+  const dg = raw.replace(/\D/g, "").slice(0, 8);
+  let dd = dg.slice(0, 2);
+  let mm = dg.slice(2, 4);
+  const yyyy = dg.slice(4, 8);
+  if (dd.length === 2 && +dd > 31) dd = "31";
+  if (mm.length === 2 && +mm > 12) mm = "12";
+  let out = dd;
+  if (dg.length >= 3) out += "/" + mm;
+  if (dg.length >= 5) out += "/" + yyyy;
+  return out;
+}
+// Parse "dd/mm/yyyy" → "YYYY-MM-DD" nếu là NGÀY THẬT (chặn 31/02, 31/04, 29/02 năm
+// thường, 00/…). KHÔNG giới hạn năm (mọi yyyy 4 chữ số). else → null.
+export function parseDisplay(s: string): string | null {
+  const m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) return null;
+  const d = +m[1], mo = +m[2], y = +m[3];
+  if (mo < 1 || mo > 12 || d < 1 || d > 31 || y < 1) return null;
+  const dt = new Date(y, mo - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
+  return `${y}-${pad(mo)}-${pad(d)}`;
+}
 
 export function DateField({
   value,
@@ -49,6 +74,56 @@ export function DateField({
 }) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+
+  // Cho phép GÕ TAY dd/mm/yyyy: `text` là chuỗi đang gõ, đồng bộ với `value`
+  // khi không focus (để lịch/parent cập nhật vẫn hiển thị đúng).
+  const [text, setText] = useState(() => toDisplay(value));
+  const [focused, setFocused] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const errId = id ? `${id}-err` : undefined;
+  useEffect(() => {
+    if (!focused) {
+      setText(toDisplay(value));
+      setError(null);
+    }
+  }, [value, focused]);
+
+  const handleTextChange = (raw: string) => {
+    const f = formatTyping(raw);
+    setText(f);
+    if (f === "") {
+      setError(null);
+      onChange("");
+      return;
+    }
+    if (f.length < 10) {
+      setError(null); // đang gõ dở → chưa báo lỗi
+      return;
+    }
+    const iso = parseDisplay(f);
+    if (iso) {
+      setError(null);
+      onChange(iso); // đủ dd/mm/yyyy + ngày thật → commit
+    } else {
+      setError("Ngày không tồn tại. Nhập theo dd/mm/yyyy.");
+    }
+  };
+  const handleBlur = () => {
+    setFocused(false);
+    if (text.trim() === "") {
+      setError(null);
+      onChange("");
+      return;
+    }
+    const iso = parseDisplay(text);
+    if (iso) {
+      setError(null);
+      onChange(iso);
+    } else {
+      // KHÔNG xoá âm thầm — giữ nguyên chuỗi + báo lỗi để người dùng sửa.
+      setError("Ngày không hợp lệ. Nhập theo dd/mm/yyyy (ví dụ 15/08/2027).");
+    }
+  };
 
   const base = value ? new Date(value + "T00:00:00") : new Date();
   const [view, setView] = useState<{ y: number; m: number }>({
@@ -112,6 +187,7 @@ export function DateField({
 
   const pick = (day: number) => {
     onChange(`${view.y}-${pad(view.m + 1)}-${pad(day)}`);
+    setError(null);
     setOpen(false);
   };
 
@@ -126,20 +202,48 @@ export function DateField({
 
   return (
     <div className="relative" ref={ref}>
-      <button
-        type="button"
-        id={id}
-        disabled={disabled}
-        onClick={() => !disabled && setOpen((o) => !o)}
-        className={`w-full min-h-[44px] px-3 py-2 text-sm border rounded-lg bg-white flex items-center justify-between gap-2 disabled:opacity-50 ${className}`}
+      {/* Ô nhập: GÕ TAY dd/mm/yyyy (tự chèn "/"), + icon lịch để chọn bằng lịch */}
+      <div
+        className={`relative w-full min-h-[44px] border rounded-lg bg-white flex items-center ${disabled ? "opacity-50" : ""} ${error ? "border-rose-500" : className}`}
       >
-        <span className={value ? "text-on-surface" : "text-on-surface-variant/50"}>
-          {value ? toDisplay(value) : placeholder}
-        </span>
-        <span className="material-symbols-outlined text-[18px] text-on-surface-variant/70">
-          calendar_month
-        </span>
-      </button>
+        <input
+          type="text"
+          id={id}
+          inputMode="numeric"
+          disabled={disabled}
+          placeholder={placeholder}
+          value={text}
+          maxLength={10}
+          aria-invalid={!!error}
+          aria-describedby={error ? errId : undefined}
+          onFocus={() => setFocused(true)}
+          onChange={(e) => handleTextChange(e.target.value)}
+          onBlur={handleBlur}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              handleBlur();
+              (e.target as HTMLInputElement).blur();
+            }
+          }}
+          className="w-full min-h-[44px] pl-3 pr-10 py-2 text-sm text-on-surface bg-transparent rounded-lg outline-none placeholder:text-on-surface-variant/50"
+        />
+        <button
+          type="button"
+          disabled={disabled}
+          tabIndex={-1}
+          onClick={() => !disabled && setOpen((o) => !o)}
+          aria-label="Mở lịch chọn ngày"
+          className="absolute right-1 top-1/2 -translate-y-1/2 w-9 h-9 flex items-center justify-center rounded-lg hover:bg-surface-low text-on-surface-variant/70"
+        >
+          <span className="material-symbols-outlined text-[18px]">calendar_month</span>
+        </button>
+      </div>
+
+      {error && (
+        <p id={errId} role="alert" className="mt-1 text-[11px] md:text-xs font-medium text-rose-600">
+          {error}
+        </p>
+      )}
 
       {open && (
         <>
@@ -335,6 +439,7 @@ export function DateField({
               type="button"
               onClick={() => {
                 onChange("");
+                setError(null);
                 setOpen(false);
               }}
               className="text-xs font-semibold text-rose-600 px-2 py-1.5 rounded hover:bg-rose-50"
@@ -345,6 +450,7 @@ export function DateField({
               type="button"
               onClick={() => {
                 onChange(tdy);
+                setError(null);
                 setOpen(false);
               }}
               className="text-xs font-semibold text-primary px-2 py-1.5 rounded hover:bg-primary/5"

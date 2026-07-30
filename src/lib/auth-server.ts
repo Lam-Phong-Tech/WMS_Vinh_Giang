@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import * as jwt from "jsonwebtoken";
 import { prisma } from "./prisma";
+import { can, ensurePermissionMatrixLoaded, type Resource, type ActionType } from "./permissions";
 
 /**
  * Lớp helper xác thực + RBAC dùng cho mọi API route business.
@@ -33,8 +34,6 @@ export type SessionRole =
   | "THU_KHO"
   | "XE_NANG"
   | "KIEM_KE";
-
-const SUPER_ROLES: SessionRole[] = ["ADMIN", "MANAGER", "STAFF"];
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -138,10 +137,12 @@ export async function requireAuth(
     sessionId = session.id;
   }
 
-  // Role gate: super-role tự pass; còn lại phải nằm trong allowedRoles.
+  // Role gate (deny-by-default, KHÔNG còn super-role bypass — WMS-002).
+  // Lưu ý: hầu hết route nay dùng requirePermission (ma trận permissions.ts);
+  // nhánh allowedRoles này giữ lại cho tương thích nhưng không ưu ái super-role.
   if (allowedRoles && allowedRoles.length > 0) {
     const role = user.role as SessionRole;
-    if (!SUPER_ROLES.includes(role) && !allowedRoles.includes(role)) {
+    if (!allowedRoles.includes(role)) {
       throw new ApiError(403, "Không có quyền thực hiện thao tác này");
     }
   }
@@ -158,6 +159,49 @@ export async function requireAuth(
     sessionId,
     token,
   };
+}
+
+/**
+ * WVG-16 / WMS-002 — Enforce phân quyền deny-by-default ở BACKEND.
+ *
+ * Khác `requireAuth(req, allowedRoles)` cũ ở chỗ:
+ *  - Không dựa trên danh sách role rời rạc mà tra MA TRẬN quyền (permissions.ts).
+ *  - KHÔNG có super-role bypass: ADMIN/MANAGER/STAFF cũng phải có grant tường minh.
+ *  - Thiếu grant → 403 (deny-by-default).
+ *
+ * Dùng ở đầu mỗi route: `await requirePermission(req, "pallet", "read")`.
+ */
+export async function requirePermission(
+  req: Request,
+  resource: Resource,
+  action: ActionType
+): Promise<AuthContext> {
+  const ctx = await requireAuth(req); // 401 nếu chưa xác thực
+  await ensurePermissionMatrixLoaded(); // Pha 4: nạp override ma trận từ DB (cache TTL)
+  if (!can(ctx.user.role, resource, action)) {
+    throw new ApiError(403, "Không có quyền thực hiện thao tác này");
+  }
+  return ctx;
+}
+
+/**
+ * Bọc `requirePermission` trả về NextResponse lỗi (401/403) hoặc `null` nếu hợp lệ.
+ * Tiện gắn 1 dòng ở đầu handler mà không đụng try/catch nghiệp vụ sẵn có:
+ *
+ *   const denied = await guardPermission(req, "pallet", "read");
+ *   if (denied) return denied;
+ */
+export async function guardPermission(
+  req: Request,
+  resource: Resource,
+  action: ActionType
+): Promise<NextResponse | null> {
+  try {
+    await requirePermission(req, resource, action);
+    return null;
+  } catch (err) {
+    return apiErrorResponse(err);
+  }
 }
 
 export function apiErrorResponse(err: unknown): NextResponse {

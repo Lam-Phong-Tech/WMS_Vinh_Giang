@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { expiryCutoff, isExpired } from "@/lib/inventory-expiry";
+import { guardPermission } from "@/lib/auth-server";
 
 // GET /api/inventory/by-location
 //   query: code (optional — lookup 1 vị trí cụ thể, trả luôn pallet detail + sơ đồ cùng kệ)
@@ -9,6 +11,8 @@ import { prisma } from "@/lib/prisma";
 //   zones: ZoneSummary[]
 //   detail: LocationDetail | null — khi query có `code`
 export async function GET(req: NextRequest) {
+  const denied = await guardPermission(req, "inventory", "read");
+  if (denied) return denied;
   try {
     const code = req.nextUrl.searchParams.get("code")?.trim().toUpperCase();
     const zoneFilter = req.nextUrl.searchParams.get("zone") || undefined;
@@ -39,11 +43,14 @@ export async function GET(req: NextRequest) {
       },
     });
 
+    const cutoff = expiryCutoff();
     const result = locations.map((loc) => {
       const hasPallet = loc.pallets.length > 0;
       let totalQtyBox = 0;
+      let blockedQtyBox = 0; // WVG-239: phần hàng hết hạn (bị chặn) tại vị trí
       let totalWeightKg = 0;
       let hasExpiringSoon = false;
+      let hasExpired = false;
       const itemSet = new Set<string>();
       const now = new Date();
       const d30 = new Date(now.getTime() + 30 * 86400000);
@@ -53,7 +60,12 @@ export async function GET(req: NextRequest) {
         for (const l of p.lines) {
           totalQtyBox += Number(l.qty_box);
           itemSet.add(l.item_code.short_name);
-          if (l.expiry_date && new Date(l.expiry_date) <= d30) hasExpiringSoon = true;
+          if (isExpired(l.expiry_date, cutoff)) {
+            blockedQtyBox += Number(l.qty_box);
+            hasExpired = true;
+          } else if (l.expiry_date && new Date(l.expiry_date) <= d30) {
+            hasExpiringSoon = true;
+          }
         }
       }
 
@@ -69,10 +81,13 @@ export async function GET(req: NextRequest) {
         max_weight_kg: loc.max_weight_kg ? Number(loc.max_weight_kg) : null,
         has_pallet: hasPallet,
         total_qty_box: totalQtyBox,
+        blocked_qty_box: blockedQtyBox,
+        sellable_qty_box: totalQtyBox - blockedQtyBox,
         total_weight_kg: Math.round(totalWeightKg * 100) / 100,
         item_names: Array.from(itemSet).join(", "),
         pallet_count: loc.pallets.length,
         has_expiring_soon: hasExpiringSoon,
+        has_expired: hasExpired,
         pallets: loc.pallets.map((p) => ({ id: p.id, code: p.code, status: p.status })),
       };
     });
@@ -109,6 +124,7 @@ export async function GET(req: NextRequest) {
             expiry_date: ln.expiry_date,
             qty_box: Number(ln.qty_box),
             weight_kg: Number(ln.weight_kg),
+            is_expired: isExpired(ln.expiry_date, cutoff),
           }))
         );
 

@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getRequestActor, logAudit } from "@/lib/audit";
 import { notifyByRoles } from "@/lib/notifications";
+import { guardPermission } from "@/lib/auth-server";
+import { buildMovementSnapshot } from "@/lib/movement-snapshot";
 
 // POST /api/forklift/relocate — Chuyển pallet sang vị trí mới (UC-FK-03)
 //
@@ -11,6 +13,8 @@ import { notifyByRoles } from "@/lib/notifications";
 //   - Validate QR format vị trí đích.
 //   - Hỗ trợ tra location bằng code (QR scan).
 export async function POST(req: NextRequest) {
+  const denied = await guardPermission(req, "forklift", "write");
+  if (denied) return denied;
   try {
     const body = await req.json();
     const { pallet_id, new_location_id: newLocIdInput, new_location_code, reason } = body;
@@ -145,15 +149,23 @@ export async function POST(req: NextRequest) {
       });
       await tx.location.update({ where: { id: oldLocationId }, data: { status: newOldStatus } });
       await tx.location.update({ where: { id: newLocation.id }, data: { status: newNewStatus } });
-      await tx.movement.create({
-        data: {
-          pallet_id,
-          movement_type: "RELOCATE",
-          from_location_id: oldLocationId,
-          to_location_id: newLocation.id,
-          performed_by: actor.userId ?? undefined,
-          reason: reason || null,
-        },
+      // WVG-179: ledger snapshot — 1 movement / mỗi dòng pallet (đủ item/lot/qty).
+      const lines = await tx.palletLine.findMany({
+        where: { pallet_id },
+        select: { item_code_id: true, lot: true, expiry_date: true, qty_box: true, qty_unit: true },
+      });
+      await tx.movement.createMany({
+        data: buildMovementSnapshot(
+          {
+            pallet_id,
+            movement_type: "RELOCATE",
+            from_location_id: oldLocationId,
+            to_location_id: newLocation.id,
+            performed_by: actor.userId ?? null,
+            reason: reason || null,
+          },
+          lines
+        ),
       });
       return p;
     });

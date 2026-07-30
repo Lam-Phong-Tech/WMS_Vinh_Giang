@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { Prisma } from "@prisma/client";
 import { getRequestActor, logAudit } from "@/lib/audit";
 import { notifyByRoles } from "@/lib/notifications";
+import { guardPermission } from "@/lib/auth-server";
 
 // POST /api/outbound/release — DEMO XUẤT KHO ĐƠN GIẢN (UC-OUT-05_TC09).
 // Khách chưa chốt quy trình xuất kho chính thức → bản demo tối giản:
@@ -11,6 +12,8 @@ import { notifyByRoles } from "@/lib/notifications";
 // Giải phóng vị trí (nếu có) + ghi Movement type=SHIP (UC-FK-06_TC19: hiện trong
 // Lịch sử luân chuyển) + audit (kèm user).
 export async function POST(req: NextRequest) {
+  const denied = await guardPermission(req, "outbound", "write");
+  if (denied) return denied;
   try {
     const body = await req.json();
     const { pallet_id } = body;
@@ -62,13 +65,23 @@ export async function POST(req: NextRequest) {
         await tx.location.update({ where: { id: oldLocationId }, data: { status: "EMPTY" } });
       }
       // UC-FK-06_TC19: ghi Movement 'SHIP' để sự kiện xuất kho hiện trong Lịch sử luân chuyển.
+      // WVG-179: bổ sung snapshot nội dung (item/lot/HSD) cho ledger đủ truy vết.
+      // SHIP giữ 1 movement (để gắn audit) → item/lot theo dòng chính; qty_box = tổng xuất.
+      const sLines = await tx.palletLine.findMany({
+        where: { pallet_id },
+        select: { item_code_id: true, lot: true, expiry_date: true },
+      });
+      const sPrimary = sLines[0];
       const shipMv = await tx.movement.create({
         data: {
           pallet_id,
           movement_type: "SHIP",
           from_location_id: oldLocationId,
           to_location_id: null,
+          item_code_id: sPrimary?.item_code_id ?? null,
           qty_box: new Prisma.Decimal(totalQty),
+          lot: sPrimary?.lot ?? null,
+          expiry_date: sPrimary?.expiry_date ?? null,
           mode: "FULL",
           reason: `Xuất kho ${pallet.code} (${totalQty} thùng) — rời kho.`,
           performed_by: actor.userId ?? undefined,

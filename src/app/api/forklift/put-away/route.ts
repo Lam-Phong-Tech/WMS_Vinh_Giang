@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getRequestActor, logAudit } from "@/lib/audit";
 import { notifyByRoles } from "@/lib/notifications";
+import { guardPermission } from "@/lib/auth-server";
+import { buildMovementSnapshot } from "@/lib/movement-snapshot";
 
 // POST /api/forklift/put-away — Đưa pallet vào vị trí (CONFIRMED → IN_STORAGE)
 //
@@ -11,6 +13,8 @@ import { notifyByRoles } from "@/lib/notifications";
 //   - Set performed_by trên Movement từ JWT.
 //   - Hỗ trợ tra location_id từ location_code (QR scan trả code, không phải id).
 export async function POST(req: NextRequest) {
+  const denied = await guardPermission(req, "forklift", "write");
+  if (denied) return denied;
   try {
     const body = await req.json();
     const { pallet_id, location_id: locIdInput, location_code } = body;
@@ -134,13 +138,22 @@ export async function POST(req: NextRequest) {
         where: { id: location_id },
         data: { status: newLocationStatus },
       });
-      await tx.movement.create({
-        data: {
-          pallet_id,
-          movement_type: "PUT_AWAY",
-          to_location_id: location_id,
-          performed_by: actor.userId ?? undefined,
-        },
+      // WVG-179: ledger snapshot — 1 movement / mỗi dòng pallet (đủ item/lot/qty + from/to).
+      const lines = await tx.palletLine.findMany({
+        where: { pallet_id },
+        select: { item_code_id: true, lot: true, expiry_date: true, qty_box: true, qty_unit: true },
+      });
+      await tx.movement.createMany({
+        data: buildMovementSnapshot(
+          {
+            pallet_id,
+            movement_type: "PUT_AWAY",
+            from_location_id: pallet.location_id ?? null,
+            to_location_id: location_id,
+            performed_by: actor.userId ?? null,
+          },
+          lines
+        ),
       });
       return p;
     });

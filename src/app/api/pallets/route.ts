@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { Prisma } from "@prisma/client";
 import { logAudit } from "@/lib/audit";
+import { guardPermission } from "@/lib/auth-server";
+import { deriveCreateSource } from "@/lib/pallet-source";
+import { warehouseDateParts } from "@/lib/warehouse-date";
 
 // Helper: Sinh mã pallet PLYYMMDD.STT
 // UC-PAL-01: phải race-safe khi nhiều thủ kho cùng tạo → dùng advisory lock theo ngày
@@ -9,32 +12,30 @@ async function generatePalletCode(
   tx: Prisma.TransactionClient,
   baseDate?: Date
 ): Promise<{ code: string; codeDate: Date; codeSeq: number }> {
-  const today = baseDate ? new Date(baseDate) : new Date();
-  today.setUTCHours(0, 0, 0, 0);
-
-  const yy = String(today.getUTCFullYear()).slice(-2);
-  const mm = String(today.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(today.getUTCDate()).padStart(2, "0");
-  const dayKey = `pallet_seq_${yy}${mm}${dd}`;
+  // WVG-98: ngày kho GMT+7 (không dùng UTC) để mã không lệch 1 ngày gần nửa đêm VN.
+  const { yy, mm, dd, codeDate, dayKey } = warehouseDateParts(baseDate);
 
   // Advisory lock theo dayKey — chỉ chặn các transaction cùng đang sinh mã pallet cùng ngày
   await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${dayKey}))`;
 
   const maxSeq = await tx.pallet.aggregate({
-    where: { code_date: today },
+    where: { code_date: codeDate },
     _max: { code_seq: true },
   });
   const nextSeq = (maxSeq._max.code_seq ?? 0) + 1;
   const stt = String(nextSeq).padStart(3, "0");
   const code = `PL${yy}${mm}${dd}.${stt}`;
 
-  return { code, codeDate: today, codeSeq: nextSeq };
+  return { code, codeDate, codeSeq: nextSeq };
 }
 
 // GET /api/pallets — Danh sách pallet + tìm kiếm + lọc
 // Phase 3.5 (BUG_REPORT TC_HISTORY_PAL_002/_003): hỗ trợ filter theo
 // ngày tạo (from/to) và nhà cung cấp.
 export async function GET(req: NextRequest) {
+  // WMS-002: enforce quyền đọc pallet (deny-by-default)
+  const denied = await guardPermission(req, "pallet", "read");
+  if (denied) return denied;
   try {
     const { searchParams } = new URL(req.url);
     const q = searchParams.get("q") || "";
@@ -182,6 +183,9 @@ export async function GET(req: NextRequest) {
 // + Phương án A: auto-populate PalletLine từ InboundLine của phiếu (nếu link PHN)
 //   Body option: `auto_populate_lines: boolean` (default true)
 export async function POST(req: NextRequest) {
+  // WMS-002: enforce quyền tạo pallet
+  const denied = await guardPermission(req, "pallet", "write");
+  if (denied) return denied;
   try {
     const body = await req.json();
     const {
@@ -323,6 +327,9 @@ export async function POST(req: NextRequest) {
         totalWeightKg = totalWeightKg.add(lineWeight);
       }
 
+      // WVG-97: xác định nguồn truy vết theo link (PHN/tạm) hoặc EXCEPTION.
+      const src = deriveCreateSource({ inbound_request_id, inbound_temp_id });
+
       // Phase 3.1 — TC_CREATE_PAL_011: pallet không line = "Chưa kích hoạt" (EMPTY).
       const newPallet = await tx.pallet.create({
         data: {
@@ -333,6 +340,9 @@ export async function POST(req: NextRequest) {
           supplier_id: resolvedSupplierId,
           inbound_request_id: inbound_request_id || null,
           inbound_temp_id: inbound_temp_id || null,
+          source_type: src.source_type,
+          source_id: src.source_id,
+          source_note: src.source_note,
           inbound_date: (inbound_date || receive_date) ? new Date(inbound_date || receive_date) : null,
           note: note?.trim() || null,
           total_lines: totalLines,
