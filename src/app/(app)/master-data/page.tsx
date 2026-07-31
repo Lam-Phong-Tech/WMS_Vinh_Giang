@@ -648,10 +648,6 @@ export default function MasterDataPage() {
                         ) : (
                           <Badge variant="error">NGỪNG</Badge>
                         )}
-                        <div className="flex gap-1 mt-1">
-                          {p.manage_lot && <span className="text-[10px] px-1.5 py-0.5 bg-blue-50 text-blue-600 rounded font-medium">LÔ</span>}
-                          {p.manage_expiry && <span className="text-[10px] px-1.5 py-0.5 bg-amber-50 text-amber-600 rounded font-medium">HSD</span>}
-                        </div>
                       </td>
                       <td className="px-4 py-3 text-right">
                         <button onClick={() => openEditModal(p)} className="p-1 hover:bg-surface-mid rounded transition-colors mr-1" title="Sửa">
